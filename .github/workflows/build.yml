@@ -1,0 +1,353 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create project
+        run: |
+          mkdir -p app/src/main/java/com/gameboost/app app/src/main/res/drawable
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GameBooster"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.gameboost.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.gameboost.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:icon="@drawable/ic_boost"
+                  android:label="مسرّع الألعاب"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BoostTile"
+                      android:exported="true"
+                      android:icon="@drawable/ic_boost"
+                      android:label="تسريع اللعب"
+                      android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+                      <intent-filter>
+                          <action android:name="android.service.quicksettings.action.QS_TILE" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/drawable/ic_boost.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FF2E7D32"
+                  android:pathData="M7,2v11h3v9l7,-12h-4l4,-8z" />
+          </vector>
+          EOF
+          cat > app/src/main/java/com/gameboost/app/Booster.kt <<'EOF'
+          package com.gameboost.app
+
+          import android.app.ActivityManager
+          import android.app.NotificationManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ApplicationInfo
+          import android.provider.Settings
+
+          object Booster {
+
+              private fun prefs(c: Context) = c.getSharedPreferences("gb", Context.MODE_PRIVATE)
+
+              fun game(c: Context): String? = prefs(c).getString("game", null)
+
+              fun setGame(c: Context, pkg: String) {
+                  prefs(c).edit().putString("game", pkg).apply()
+              }
+
+              // قائمة التطبيقات القابلة للتشغيل: (اسم الحزمة، الاسم الظاهر)
+              fun launchableApps(c: Context): List<Pair<String, String>> {
+                  val pm = c.packageManager
+                  val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  return pm.queryIntentActivities(intent, 0)
+                      .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+                      .filter { it.first != c.packageName }
+                      .distinctBy { it.first }
+                      .sortedBy { it.second.lowercase() }
+              }
+
+              // يغلق تطبيقات المستخدم في الخلفية ما عدا اللعبة، ويفعّل عدم الإزعاج إن كان مسموحاً
+              fun prepare(c: Context, game: String): Int {
+                  val am = c.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                  val pm = c.packageManager
+                  var count = 0
+                  for ((pkg, _) in launchableApps(c)) {
+                      if (pkg == game) continue
+                      try {
+                          val flags = pm.getApplicationInfo(pkg, 0).flags
+                          if (flags and ApplicationInfo.FLAG_SYSTEM == 0) {
+                              am.killBackgroundProcesses(pkg)
+                              count++
+                          }
+                      } catch (e: Exception) {
+                      }
+                  }
+                  silence(c)
+                  return count
+              }
+
+              fun launchIntent(c: Context, game: String): Intent? =
+                  c.packageManager.getLaunchIntentForPackage(game)
+
+              fun silence(c: Context): Boolean {
+                  return try {
+                      val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      if (nm.isNotificationPolicyAccessGranted) {
+                          nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_NONE)
+                          true
+                      } else false
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              fun restore(c: Context) {
+                  try {
+                      val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      if (nm.isNotificationPolicyAccessGranted) {
+                          nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALL)
+                      }
+                  } catch (e: Exception) {
+                  }
+              }
+
+              fun requestDndAccess(c: Context): Boolean {
+                  return try {
+                      c.startActivity(
+                          Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/gameboost/app/MainActivity.kt <<'EOF'
+          package com.gameboost.app
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val apps = Booster.launchableApps(this)
+                  var selected: String? = Booster.game(this)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad, pad, pad)
+
+                  val title = TextView(this)
+                  title.text = "مسرّع الألعاب"
+                  title.textSize = 22f
+
+                  val hint = TextView(this)
+                  hint.text = "اختر اللعبة من القائمة ثم اضغط «ابدأ اللعب»"
+                  hint.textSize = 14f
+
+                  val list = ListView(this)
+                  val adapter = object : ArrayAdapter<Pair<String, String>>(
+                      this, android.R.layout.simple_list_item_1, apps
+                  ) {
+                      override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                          val v = super.getView(position, convertView, parent) as TextView
+                          val item = getItem(position)!!
+                          v.text = (if (item.first == selected) "✔ " else "") + item.second
+                          return v
+                      }
+                  }
+                  list.adapter = adapter
+                  list.setOnItemClickListener { _, _, pos, _ ->
+                      selected = apps[pos].first
+                      Booster.setGame(this, apps[pos].first)
+                      adapter.notifyDataSetChanged()
+                  }
+
+                  val start = Button(this)
+                  start.text = "ابدأ اللعب"
+                  start.setOnClickListener {
+                      val g = selected
+                      if (g == null) {
+                          Toast.makeText(this, "اختر اللعبة أولاً", Toast.LENGTH_SHORT).show()
+                      } else {
+                          val n = Booster.prepare(this, g)
+                          Toast.makeText(this, "تم إغلاق $n تطبيق", Toast.LENGTH_SHORT).show()
+                          val i = Booster.launchIntent(this, g)
+                          if (i != null) startActivity(i)
+                      }
+                  }
+
+                  val dnd = Button(this)
+                  dnd.text = "السماح بوضع عدم الإزعاج (اختياري)"
+                  dnd.setOnClickListener {
+                      if (!Booster.requestDndAccess(this)) {
+                          Toast.makeText(this, "هذه الميزة غير متوفرة في جهازك", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  val restore = Button(this)
+                  restore.text = "إنهاء الوضع وإرجاع الإشعارات"
+                  restore.setOnClickListener {
+                      Booster.restore(this)
+                      Toast.makeText(this, "تمت إعادة الإشعارات", Toast.LENGTH_SHORT).show()
+                  }
+
+                  root.addView(title)
+                  root.addView(hint)
+                  root.addView(list, LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+                  ))
+                  root.addView(start)
+                  root.addView(dnd)
+                  root.addView(restore)
+                  setContentView(root)
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/gameboost/app/BoostTile.kt <<'EOF'
+          package com.gameboost.app
+
+          import android.app.PendingIntent
+          import android.content.Intent
+          import android.os.Build
+          import android.service.quicksettings.Tile
+          import android.service.quicksettings.TileService
+
+          class BoostTile : TileService() {
+
+              override fun onStartListening() {
+                  val t = qsTile ?: return
+                  t.label = "تسريع اللعب"
+                  t.state = Tile.STATE_INACTIVE
+                  t.updateTile()
+              }
+
+              override fun onClick() {
+                  val game = Booster.game(this) ?: return
+                  Booster.prepare(this, game)
+                  val i = Booster.launchIntent(this, game) ?: return
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startActivityAndCollapse(
+                          PendingIntent.getActivity(this, 0, i, PendingIntent.FLAG_IMMUTABLE)
+                      )
+                  } else {
+                      @Suppress("DEPRECATION")
+                      startActivityAndCollapse(i)
+                  }
+              }
+          }
+          EOF
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameBooster-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          
